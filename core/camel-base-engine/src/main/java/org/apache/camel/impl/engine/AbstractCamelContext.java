@@ -29,6 +29,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.TreeMap;
@@ -3786,7 +3787,9 @@ public abstract class AbstractCamelContext extends BaseService
         final DataFormat answer = dataformats.computeIfAbsent(name, new Function<String, DataFormat>() {
             @Override
             public DataFormat apply(String s) {
-                DataFormat df = ResolverHelper.lookupDataFormatInRegistryWithFallback(getCamelContextReference(), name);
+                DataFormat df = Optional
+                        .ofNullable(ResolverHelper.lookupDataFormatInRegistryWithFallback(getCamelContextReference(), name))
+                        .orElse(getDataFormatResolver().createDataFormat(name, getCamelContextReference()));
 
                 if (df != null) {
                     // inject CamelContext if aware
