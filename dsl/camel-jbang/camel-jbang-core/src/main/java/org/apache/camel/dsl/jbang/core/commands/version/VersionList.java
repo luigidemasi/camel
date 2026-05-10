@@ -28,14 +28,18 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.text.SimpleDateFormat;
 import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Date;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 import com.github.freva.asciitable.AsciiTable;
@@ -55,6 +59,7 @@ import org.apache.camel.dsl.jbang.core.model.VersionListDTO;
 import org.apache.camel.main.KameletMain;
 import org.apache.camel.main.download.MavenDependencyDownloader;
 import org.apache.camel.tooling.maven.RepositoryResolver;
+import org.apache.camel.tooling.model.JsonMapper;
 import org.apache.camel.tooling.model.ReleaseModel;
 import org.apache.camel.util.StringHelper;
 import org.apache.camel.util.json.JsonArray;
@@ -81,6 +86,14 @@ public class VersionList extends CamelCommand {
             = "https://raw.githubusercontent.com/apache/camel-website/main/content/releases/release-%s.md";
     private static final String GIT_CAMEL_QUARKUS_URL
             = "https://raw.githubusercontent.com/apache/camel-website/main/content/releases/q/release-%s.md";
+
+    private static final String GIT_CAMEL_RELEASES_JSON_URL
+            = "https://raw.githubusercontent.com/apache/camel/main/catalog/camel-catalog/src/generated/resources/org/apache/camel/catalog/releases/camel-releases.json";
+    private static final String GIT_CAMEL_QUARKUS_RELEASES_JSON_URL
+            = "https://raw.githubusercontent.com/apache/camel/main/catalog/camel-catalog/src/generated/resources/org/apache/camel/catalog/releases/camel-quarkus-releases.json";
+    private static final String RELEASES_CACHE_FILE = ".camel-jbang-releases-cache.json";
+    private static final String QUARKUS_RELEASES_CACHE_FILE = ".camel-jbang-quarkus-releases-cache.json";
+    private static final long CACHE_TTL_HOURS = 24;
 
     private static final String DEFAULT_DATE_FORMAT = "MMMM yyyy";
 
@@ -183,6 +196,13 @@ public class VersionList extends CamelCommand {
 
         CamelCatalog catalog = new DefaultCamelCatalog();
         List<ReleaseModel> releases = RuntimeType.quarkus == runtime ? catalog.camelQuarkusReleases() : catalog.camelReleases();
+
+        if (download) {
+            List<ReleaseModel> onlineReleases = fetchOnlineReleases(runtime);
+            if (!onlineReleases.isEmpty()) {
+                releases = mergeReleases(releases, onlineReleases);
+            }
+        }
 
         List<Row> rows = new ArrayList<>();
         filterVersions(versions, rows, releases);
@@ -419,6 +439,9 @@ public class VersionList extends CamelCommand {
                     rm = onlineRelease(runtime, row.coreVersion);
                 }
             }
+            if (rm == null) {
+                rm = deriveReleaseMetadata(row.coreVersion);
+            }
             if (rm != null) {
                 row.releaseDate = rm.getDate();
                 row.daysSince = daysSince(rm.getDate());
@@ -624,6 +647,113 @@ public class VersionList extends CamelCommand {
         }
 
         return null;
+    }
+
+    List<ReleaseModel> fetchOnlineReleases(RuntimeType runtime) {
+        String cacheFile = RuntimeType.quarkus == runtime ? QUARKUS_RELEASES_CACHE_FILE : RELEASES_CACHE_FILE;
+        Path cachePath = CommandLineHelper.getHomeDir().resolve(cacheFile);
+
+        if (!fresh && Files.exists(cachePath)) {
+            try {
+                long ageHours = Duration.between(
+                        Files.getLastModifiedTime(cachePath).toInstant(), Instant.now()).toHours();
+                if (ageHours < CACHE_TTL_HOURS) {
+                    String json = Files.readString(cachePath);
+                    return parseReleasesJson(json);
+                }
+            } catch (Exception e) {
+                // ignore, will try to fetch
+            }
+        }
+
+        String url = RuntimeType.quarkus == runtime ? GIT_CAMEL_QUARKUS_RELEASES_JSON_URL : GIT_CAMEL_RELEASES_JSON_URL;
+        try {
+            HttpClient hc = HttpClient.newHttpClient();
+            HttpResponse<String> res = hc.send(
+                    HttpRequest.newBuilder(new URI(url)).timeout(Duration.ofSeconds(20)).build(),
+                    HttpResponse.BodyHandlers.ofString());
+
+            if (res.statusCode() == 200) {
+                String json = res.body();
+                Files.writeString(cachePath, json,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.WRITE,
+                        StandardOpenOption.TRUNCATE_EXISTING);
+                return parseReleasesJson(json);
+            }
+        } catch (Exception e) {
+            // ignore, will fall back to embedded catalog
+        }
+
+        return Collections.emptyList();
+    }
+
+    static List<ReleaseModel> parseReleasesJson(String json) {
+        try {
+            List<ReleaseModel> answer = new ArrayList<>();
+            JsonArray arr = (JsonArray) Jsoner.deserialize(json);
+            for (Object o : arr) {
+                JsonObject jo = (JsonObject) o;
+                ReleaseModel rm = JsonMapper.generateReleaseModel(jo);
+                if (rm.getVersion() != null) {
+                    answer.add(rm);
+                }
+            }
+            return answer;
+        } catch (Exception e) {
+            return Collections.emptyList();
+        }
+    }
+
+    static List<ReleaseModel> mergeReleases(List<ReleaseModel> embedded, List<ReleaseModel> online) {
+        Map<String, ReleaseModel> merged = new LinkedHashMap<>();
+        for (ReleaseModel r : embedded) {
+            merged.put(r.getVersion(), r);
+        }
+        for (ReleaseModel r : online) {
+            merged.put(r.getVersion(), r);
+        }
+        return new ArrayList<>(merged.values());
+    }
+
+    static ReleaseModel deriveReleaseMetadata(String version) {
+        if (version == null) {
+            return null;
+        }
+        String[] parts = version.split("\\.");
+        if (parts.length < 2) {
+            return null;
+        }
+        int major;
+        int minor;
+        try {
+            major = Integer.parseInt(parts[0]);
+            minor = Integer.parseInt(parts[1]);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+
+        ReleaseModel rm = new ReleaseModel();
+        rm.setVersion(version);
+
+        if (major >= 4) {
+            rm.setJdk("17,21");
+        } else if (major == 3) {
+            rm.setJdk("11,17");
+        }
+
+        if (major >= 4 && isLtsMinor(minor)) {
+            rm.setKind("lts");
+        }
+
+        return rm;
+    }
+
+    static boolean isLtsMinor(int minor) {
+        if (minor < 10) {
+            return minor % 4 == 0;
+        }
+        return (minor - 10) % 4 == 0;
     }
 
     private static class Row {
